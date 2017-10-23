@@ -1,0 +1,340 @@
+# Load data
+
+```{r}
+library(dplyr)
+library(magrittr)
+library(xlsx)
+```
+
+
+```{r}
+devtools::load_all()
+```
+
+```{r}
+fileNameData <- "/Users/yue/Dropbox/Joy/tabacco_grant/data/"
+```
+
+### Load list of medications
+
+```{r}
+medList <- as.list(read.xlsx(paste0(fileNameData,"data_fromsarah/IBD Medication List_2.17.2017.xls"), sheetIndex = 1,stringsAsFactors = F))
+medList <- sapply(medList, function(x) x = x[!is.na(x)])
+names(medList)[which(names(medList) == "Other")] = "Other.med"
+names(medList)[which(names(medList) == "X5.ASA")] = "5.ASA"
+```
+
+### Load Alex's database
+
+```{r compare_the_current_db_with_previous, eval = T}
+dataBaseVersionPrevious <- "data_fromalex/database/database08082017"
+dataBaseVersion <- "data_fromalex/database/database10052017"
+```
+
+```{r load_mapping_info, eval = T}
+# load mapping between ehb_id and record_id like 11817-xxx
+alex_external_records_protocols <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/external_records_protocols.csv")) %>%
+  select(subject, record_id, ehb_id) %>%
+  unique()
+# This table contains the various forms that a subject filled in, for reference only.
+alex_external_records_subjects <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/external_records_subjects.csv"))
+
+# load mapping between aliquot id and nautilusid
+alex_nautilusaliquot <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/nautilusaliquot.csv"))
+length(unique(alex_nautilusaliquot$aliquot_id))
+length(unique(alex_nautilusaliquot$sample_subject_name))
+# 
+alex_mapping <- merge(alex_nautilusaliquot, alex_external_records_protocols, by.x = "sample_subject_name", by.y = "record_id", all.x= T, all.y = T)
+```
+
+```{r load_subject_info, eval = T}
+# load demographics information 
+alex_demographics_information <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/demographics_information.csv"))
+alex_subject_baseline <- alex_demographics_information
+
+# load ethnicity information this table is empty
+
+# load race 
+alex_race <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/race.csv"))# same ehb id but different race, because the check multiple boxes
+# if one ehbid have multiple results then we combine them into one string
+alex_race %<>% group_by(ehb_id) %>%
+  summarise(n_of_race = length(race), race = paste(race, collapse = ","), redcap_event_name = unique(redcap_event_name)) %>%
+  ungroup() %>%
+  as.data.frame()
+
+alex_subject_baseline %<>% join_fromalex_subject(alex_race)
+
+# load group information 
+alex_subject_baseline_group <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/subject_group.csv")) %>%
+  mutate(study_group = factor(subject_group, 
+                              levels = c("Group 1","Group 2", "Group 3", "Group 4", "Group 5","Group 6", "Group 7"),
+                              labels = c("IBD_Antibiotics","IBD_C.Diff", "IBD_Natural_History", "Healthy", "VEO", "Healthy_Antibiotics","IBD_Therapy")))
+# there are subjects in multiple study groups, combine them into one string
+alex_subject_baseline_group %<>% group_by(ehb_id) %>%
+  mutate(study_group = paste0(study_group, collapse = ","), subject_group = paste0(subject_group, collapse = ",")) %>%
+  ungroup() %>%
+  unique
+alex_subject_baseline %<>% join_fromalex_subject(alex_subject_baseline_group)
+
+# # load if the patient initiated abx before baseline for stool samples
+# alex_antibiotics_initiating_visit_baseline <- read.csv(file = paste0(dataBaseVersion, "/antibiotics_initiating_visit_baseline.csv"), stringsAsFactors = F)
+
+# load if the patient initiated abx before baseline
+alex_antiobiotics_timing <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/antiobiotics_timing.csv"))
+alex_subject_baseline %<>% join_fromalex_subject(alex_antiobiotics_timing )
+
+# load problem list
+alex_problem_list <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/problem_list.csv")) %>%
+  rename(date_illness = date)
+# it has mutiple records for each subject 
+# combine them into one string
+alex_problem_list %<>% group_by(ehb_id) %>%
+  summarise(n_of_problem = length(chronic_illness), chronic_illness = paste0(chronic_illness, collapse = ","), date_illness = paste0(date_illness, collapse = ",")) %>%
+  ungroup() %>%
+  as.data.frame()
+
+alex_subject_baseline %<>% join_fromalex_subject(alex_problem_list, ID = "ehb_id")
+
+## all the above information are the same for visit2 and visit 3, so replicate it
+unique(alex_subject_baseline$redcap_event_name)
+alex_subject <- alex_subject_baseline %>% bind_rows(alex_subject_baseline %>% mutate(redcap_event_name = "Visit 2")) %>%
+  bind_rows(alex_subject_baseline %>% mutate(redcap_event_name = "Visit 3"))
+
+# load sample_redcap
+alex_sample_redcap <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/sample_redcap.csv")) 
+alex_subject %<>% join_fromalex_subject(alex_sample_redcap) %>%
+  rename(collect_date_time = Collected_Time)
+# there are some subject do not have an available collect date time because those samples has not been colleted
+alex_subject %<>% filter(!is.na(collect_date_time))
+
+# load surgery 
+alex_ibd_surgery <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/ibd_surgery.csv"))
+# surgery has multiple record for one visit, so we need to combine them
+alex_ibd_surgery %<>% group_by(redcap_event_name, ehb_id) %>%
+  mutate(n_surgery = length(unique(ibd_surgery)), 
+         ibd_surgery = paste0(ibd_surgery, collapse = ","),
+         surgery_date = paste0(surgery_date, collapse = ",")) %>%
+  ungroup() %>%
+  unique
+alex_subject %<>% join_fromalex_subject(alex_ibd_surgery)
+
+# load diagnosis
+alex_ibd_diagnosis <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion,"/ibd_diagnosis.csv"))
+# change some lables
+alex_ibd_diagnosis %<>% mutate(ibd_diagnosis = ifelse(ibd_diagnosis ==  "Crohn's Disease","Crohn's", ibd_diagnosis))
+alex_ibd_diagnosis %<>% mutate(ibd_diagnosis = ifelse(ibd_diagnosis ==  "Indeterminate colitis","Indeterminate Colitis", ibd_diagnosis))
+alex_ibd_diagnosis %<>% mutate(ibd_diagnosis = ifelse(ibd_diagnosis ==  "Ulcerative coliits","Ulcerative Colitis", ibd_diagnosis))
+
+alex_subject %<>% join_fromalex_subject(alex_ibd_diagnosis)
+
+# load rectal bleed data 
+alex_level_rectal_bleed <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/level_rectal_bleed.csv"))
+alex_subject %<>% join_fromalex_subject(alex_level_rectal_bleed)
+
+
+# load hospital information
+alex_hospital_admit <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/hospital_admit.csv"))
+alex_subject %<>% merge(alex_hospital_admit, by = c("ehb_id","redcap_event_name"), all.x = T, all.y = F)
+
+
+# rename the sample type
+alex_subject %<>% mutate(Sample.Type = factor(Sample.Type, levels = c("OSWB01", "STL01", "RSWB01"), labels = c("Oral Swab", "Stool", "Rectal Swab")))
+```
+
+```{r}
+# there are some subjects have records but no available collect date time
+
+# View(alex_subject %>% filter(is.na(collect_date_time)))
+
+# remove them for now
+# write.csv(alex_subject %>% filter(is.na(collect_date_time)), file = "problem/NoCollectDate.csv")
+alex_subject %<>% filter(!is.na(collect_date_time))
+```
+
+```{r pucai_and_pcdai_score, eval = T}
+# load pcdai score at baseline
+alex_pcdai_score_baseline <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/pcdai_score_baseline.csv"))
+
+# load pcdai score at visit2 and visit 3
+alex_pcdai_score_followup <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/pcdai_score_followup.csv"))
+
+# load pucai score at visit2 and visit3
+alex_pucai_score <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/pucai_score.csv"))
+
+# load pucai score numeric
+
+alex_pucai_score_numeric <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion,"/pucai_numeric_score.csv"))
+
+
+# add numeric pucai score to the subject information
+alex_subject %<>% left_join(alex_pucai_score_numeric, by = c("ehb_id", "redcap_event_name"))
+```
+
+```{r load_sample_info, eval = T}
+# load sample_visit_event
+alex_sample_visit_event <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/sample_visit_event.csv"), uselessColumns = c("X"))
+
+alex_sample <- alex_sample_visit_event
+
+# load age of sample collection
+alex_age_at_collection <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/age_at_collection.csv"), uselessColumns = "X")%>%
+  mutate(age_yrs = gsub("days.*","days", age),
+         age_yrs = tidyr::extract_numeric(age_yrs)/365) %>%
+  select(sample_subject_name, age_yrs)
+
+# View(alex_age_at_collection %>% filter(sample_subject_name %in% sample_subject_name[duplicated(sample_subject_name)]))
+alex_age_at_collection[which(alex_age_at_collection$sample_subject_name == "11817-249"),]
+# there duplicated records, one age available and the other is na, choose the available one.
+alex_age_at_collection %<>% group_by(sample_subject_name) %>%
+  arrange(sample_subject_name, age_yrs) %>%
+  slice(1) %>%
+  ungroup() %>%
+  as.data.frame()
+alex_age_at_collection[which(alex_age_at_collection$sample_subject_name == "11817-249"),]
+
+alex_sample %<>% join_fromalex_sample(alex_age_at_collection) 
+
+# load age at diagnosis
+alex_age_at_diagnosis <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/age_at_diagnosis.csv"), uselessColumns = "X") %>%
+  mutate(age_diag_yrs = age_diagnosis_days/365) %>%
+  select(sample_subject_name, age_diag_yrs)
+
+alex_sample %<>% join_fromalex_sample(alex_age_at_diagnosis)
+
+# load albumin information 
+alex_tobacco_grant_albumin <- read_alex_database(file = paste0(fileNameData,dataBaseVersion, "/tobacco_grant_albumin.csv"), uselessColumns = c("X", "index","rank_id")) %>%
+  unique
+# there are duplicated records choose the lab before sample collection (the earlier one)
+# View(alex_tobacco_grant_albumin[duplicated(alex_tobacco_grant_albumin$sample_subject_name),])
+# View(alex_tobacco_grant_albumin)
+alex_tobacco_grant_albumin %<>% group_by(sample_subject_name) %>%
+  filter(Days.Between_albumin == max(Days.Between_albumin)) %>%
+  ungroup() %>%
+  select(sample_subject_name,order_value_string_albumin, reference_unit_albumin, result_time_albumin)
+
+alex_sample %<>% join_fromalex_sample(alex_tobacco_grant_albumin)
+
+# load fcp
+alex_tobacco_grant_calprotectin <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/tobacco_grant_calprotectin.csv")) %>%
+  select(sample_subject_name, order_value_string_calprot, reference_unit_calprot, result_time_calprot)# no duplicated records
+
+alex_sample %<>% join_fromalex_sample(alex_tobacco_grant_calprotectin)
+
+# load ESR
+alex_tobacco_grant_ESR <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/tobacco_grant_ESR.csv")) %>%
+  unique %>%
+  filter(!order_value_string_esr %in% c("Not Done", "SEE NOTE"))
+# there are duplicated records choose the lab before sample collection (the earlier one)
+# View(alex_tobacco_grant_ESR[duplicated(alex_tobacco_grant_ESR$sample_subject_name),])
+# View(alex_tobacco_grant_ESR)
+alex_tobacco_grant_ESR %<>% group_by(sample_subject_name) %>%
+  filter(Days.Between_ESR == max(Days.Between_ESR)) %>%
+  ungroup() %>%
+  select(sample_subject_name, order_value_string_esr, reference_unit_esr, result_time_esr)
+
+alex_sample %<>% join_fromalex_sample(alex_tobacco_grant_ESR)
+
+# load HCT
+alex_tobacco_grant_HCT <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/tobacco_grant_HCT.csv"), uselessColumns = c("X","index","rank_id")) %>%
+  unique
+# there are duplicated records choose the lab before sample collection (the earlier one)
+# View(alex_tobacco_grant_HCT[duplicated(alex_tobacco_grant_HCT$sample_subject_name),])
+# View(alex_tobacco_grant_HCT)
+alex_tobacco_grant_HCT %<>% group_by(sample_subject_name) %>%
+  filter( Days.Between_HCT == max(Days.Between_HCT)) %>%
+  ungroup() %>%
+  select(sample_subject_name,order_value_string_hct, reference_unit_hct, result_time_hct)
+
+alex_sample %<>% join_fromalex_sample(alex_tobacco_grant_HCT)
+
+
+# load HGB
+alex_tobacco_grant_HGB <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/tobacco_grant_HGB.csv")) %>%
+  unique()
+# there are duplicated records choose the lab before sample collection (the earlier one)
+# View(alex_tobacco_grant_HGB[duplicated(alex_tobacco_grant_HGB$sample_subject_name),])
+# View(alex_tobacco_grant_HGB)
+alex_tobacco_grant_HGB %<>% group_by(sample_subject_name) %>%
+  filter(Days.Between_HGB == max(Days.Between_HGB)) %>%
+  ungroup() %>%
+  select(sample_subject_name, order_value_string_hgb, reference_unit_hgb, result_time_hgb)
+
+alex_sample %<>% join_fromalex_sample(alex_tobacco_grant_HGB)
+
+# joint with the mapping between sample_subject_name to nautilusid
+unique(alex_sample$sample_subject_name %in% alex_nautilusaliquot$sample_subject_name)
+
+alex_sample %<>% left_join(alex_mapping, by = "sample_subject_name") %>%
+  unique
+
+alex_sample %<>% mutate(sample_subject_name = as.integer(gsub(".*-","", sample_subject_name)))
+```
+
+
+
+```{r load_medication_data, eval= T}
+## medication data 
+# load the baseline abx raw data
+alex_baseline_antibiotics <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/baseline_antibiotics.csv"))
+
+## check medication names in alex_baseline_antibiotics
+alex_baseline_antibiotics %<>% mutate(med_name = ifelse(med_name %in% c( "Cefazolin", "CEFAZOLIN"),"Cefazolin", med_name),
+                                      other_name = ifelse(other_name %in% c( "Cefazolin", "CEFAZOLIN"),"Cefazolin",other_name))
+alex_baseline_antibiotics %<>% mutate(other_name = ifelse(other_name %in% c("doxycycline", "Doxycycline"),"Doxycycline" ,other_name))
+
+alex_baseline_antibiotics %<>% mutate(med_name = ifelse(med_name == "Other",other_name, med_name)) %>%
+  select(-other_name, -redcap_event_name) %>%
+  rename(antibiotic_name = med_name, dose = antibio_dose) %>%
+  mutate(duration = ifelse(duration %in% c("UNKNOWN","","Unknown","2017-01-27"), NA, duration)) %>%
+  mutate(duration = as.numeric(duration)) %>%
+  mutate(stop_date = ifelse(stop_date == "2015-11-31", "2015-12-01", stop_date)) %>%
+  mutate(stop_date = ifelse(stop_date == "08/01/2016", "2016-08-01", stop_date)) %>%
+  mutate(stop_date = ifelse(stop_date == "3016-03-20", "2016-03-20", stop_date)) %>%
+  mutate(stop_date = ifelse(stop_date %in% c("UNKNOWN", "Unknown",""), NA, stop_date)) %>%
+  mutate(stop_date = as.Date(stop_date)) %>%
+  mutate(start_date = stop_date - duration) %>%
+  mutate(med_name = "Antibiotics",med_free_text_other = NA, enteral_nutrition_therapy = NA, healthy_patient_antibiotics_note = NA)
+
+
+# load raw medication log data 
+alex_medication_log <- read_alex_database(fileName = paste0(fileNameData,dataBaseVersion, "/medication_log.csv"))
+alex_medication_log %<>% mutate(start_date = as.Date(start_date)) %>%
+  mutate(stop_date = as.Date(stop_date)) %>%
+  mutate(duration = stop_date - start_date)
+
+alex_medication_log %<>% bind_rows(alex_baseline_antibiotics)
+remove(alex_baseline_antibiotics)
+
+alex_medication_log %<>% mutate(med_free_text_other = ifelse(med_free_text_other == "IV Cefazolin", "Cefazolin IV", med_free_text_other))
+alex_medication_log %<>% mutate(med_free_text_other = ifelse(med_free_text_other == "Methotrexate subq", "Methotrexate SubQ", med_free_text_other))
+alex_medication_log %<>% mutate(med_free_text_other = ifelse(med_free_text_other == "Pantaprazole", "Pantoprazole", med_free_text_other))
+alex_medication_log %<>% mutate(med_free_text_other = ifelse(med_free_text_other == "prednisolone", "Prednisolone", med_free_text_other))
+
+# add sample information 
+a = alex_subject %>%
+  select(ehb_id, redcap_event_name, collect_date_time, Sample.Type) %>%
+  unique
+
+alex_medication_log %<>% left_join(a, by = c("ehb_id")) %>%
+  rename(SampleType = Sample.Type) %>%
+  mutate(SampleType = factor(SampleType, levels = c("Oral Swab", "Stool", "Rectal Swab"), labels = c( "Tongue Swab","Feces", "Rectal Swab"))) %>%
+  mutate(SampleType = as.character(SampleType))
+remove(a)
+# ff1325980d7e2372a009945ccaaf3819
+# # check for the same date records
+# a = alex_subject %>% 
+#   select(ehb_id, redcap_event_name, collect_date_time, contains("timing")) %>%
+#   unique()
+# alex_medication_log %<>% left_join(a, by = c("ehb_id", "redcap_event_name", "collect_date_time"))
+# remove(a)
+# View(alex_medication_log%>% filter(stop_date == collect_date_time|start_date == collect_date_time))
+
+
+
+alex_medRaw <- read_alex_database_med_log(dataFrame = alex_medication_log, medList = medList)
+# there are some records could not be found in the alex_subject data set remove them
+# write.csv(alex_medRaw %>% filter(is.na(collect_date_time)), file = "problem/NoCollectDateMed.csv")
+alex_medRaw %<>% filter(ehb_id %in% unique(alex_subject$ehb_id))
+alex_medData = process_alex_database_med_log(medRaw = alex_medRaw)
+alex_medData %<>% mutate(collect_date_time = as.character(collect_date_time)) 
+```
